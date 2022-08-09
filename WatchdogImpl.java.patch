@@ -1,0 +1,154 @@
+diff --git a/services/java/com/android/server/WatchdogImpl.java b/services/java/com/android/server/WatchdogImpl.java
+index 4043d9935..151b12702 100644
+--- a/services/java/com/android/server/WatchdogImpl.java
++++ b/services/java/com/android/server/WatchdogImpl.java
+@@ -16,6 +16,8 @@ import com.android.internal.os.ProcessCpuTracker;
+ import com.android.server.am.ActivityManagerService;
+ import java.io.BufferedReader;
++import java.io.BufferedInputStream;
++import java.io.BufferedOutputStream;
+ import java.io.File;
+ import java.io.FileInputStream;
+ import java.io.FileOutputStream;
+@@ -39,6 +41,7 @@ import java.util.concurrent.TimeoutException;
+ import java.util.concurrent.FutureTask;
+ import java.util.concurrent.Callable;
+ import java.util.concurrent.atomic.AtomicReference;
++import java.util.zip.GZIPOutputStream;
+ import libcore.io.IoUtils;
+@@ -56,6 +59,11 @@ public class WatchdogImpl extends WatchdogStub {
+             SystemProperties.getBoolean("persist.sys.oom_crash_on_watchdog", false);
+     private static final int HEAP_MONITOR_THRESHOLD =
+             SystemProperties.getInt("persist.sys.oom_crash_on_watchdog_size", 500);
++//+++duguowei
++    private int last_mem = 0;//kb
++    private int last_pid = -1;
++    private static final int BUFFER_SIZE = 8192;
++//---duguowei
+     private static final long KB = 1024;
+     private static final long MB = KB * 1024;
+     private static final long GB = MB * 1024;
+@@ -187,6 +195,109 @@ public class WatchdogImpl extends WatchdogStub {
+         ScoutSystemMonitor.getInstance().pauseScoutWatchingCurrentThread(reason);
+     }
+ 
++//+++duguowei
++    private String getProcComm(int pid) {
++        File file = new File("/proc/" + pid + "/comm");
++        if (file.isFile()) {
++            FileInputStream fis = null;
++            try {
++                fis = new FileInputStream(file);
++                byte[] buffer = new byte[100];
++
++                int len;
++                if ((len = fis.read(buffer)) != -1 ) {
++                    return new String(buffer, 0, len-1);
++                } else {
++                    return null;
++                }
++            } catch (IOException ex) {
++                return null;
++            } finally {
++                try {
++                    if (null != fis) {
++                        fis.close();
++                    }
++                } catch (IOException ex) {
++                    Slog.e(HEAP_MONITOR_TAG, "failed to readProcCmdlineFile:" + ex.getMessage());
++                }
++            }
++        } else {
++            return null;
++        }
++    }
++
++    private static boolean copyToGzFile(final File inFile, final File outFile) {
++        try (
++            BufferedInputStream in = new BufferedInputStream(new FileInputStream(inFile));
++            GZIPOutputStream out = new GZIPOutputStream(new BufferedOutputStream(
++                    new FileOutputStream(outFile)))) {
++            final byte[] buffer = new byte[BUFFER_SIZE];
++            while (true) {
++                int t = in.read(buffer, 0, BUFFER_SIZE);
++                if (t < 0) {
++                    break;
++                }
++                out.write(buffer, 0, t);
++            }
++        } catch (IOException e) {
++            Slog.e(HEAP_MONITOR_TAG, "Error in copying smaps file from " + inFile + " to " + outFile, e);
++            return false;
++        }
++        return true;
++    }
++
++    private void checkProcessOomState(int pid){
++        if (pid == -1) return;
++        if (pid != last_pid) {
++            last_pid = pid;
++            last_mem = 0;
++        }
++
++        //1.dump meminfo of process
++        Debug.MemoryInfo mi = null;
++        mi = new Debug.MemoryInfo();
++        Debug.getMemoryInfo(pid, mi);
++        int mem_total = mi.getTotalPss();
++        int mem_java = mi.getSummaryJavaHeap();
++        int mem_native = mi.getSummaryNativeHeap();
++        int mem_code = mi.getSummaryCode();
++        int mem_stack = mi.getSummaryStack();
++        int mem_graphic = mi.getSummaryGraphics();
++        int mem_priv_other = mi.getSummaryPrivateOther();
++        int mem_system = mi.getSummarySystem();
++        int swap = 0;
++        if (mi.hasSwappedOutPss) {
++            swap = mi.getSummaryTotalSwapPss();
++        } else {
++            swap = mi.getSummaryTotalSwap();
++        }
++        Slog.d(HEAP_MONITOR_TAG, "MemInfo of pid: " + pid + " is : "
++                                + "Total pss:" + mem_total
++                                + ",Java Heap:" + mem_java
++                                + ",Native Heap:" + mem_native
++                                + ",Code:" + mem_code
++                                + ",Stack:" + mem_stack
++                                + ",Graphics:" + mem_graphic
++                                + ",Private Other:" + mem_priv_other
++                                + ",System:" + mem_system
++                                + ",swap:" + swap
++                                + "(KB)");
++
++        //2.pull smaps
++        if (last_mem == 0) last_mem = mem_total;
++        int mem_interval = SystemProperties.getInt("debug.mem_interval", 500);//mb
++        if (mem_interval <= 0) mem_interval = 500;
++        if ((mem_total - last_mem) < (mem_interval << 10)) return;
++        last_mem = mem_total;
++        SimpleDateFormat dateFormat = new SimpleDateFormat("yyyy_MM_dd_HH_mm_ss");
++        String newTracesPath = "mem_" + getProcComm(pid) + "_"+ dateFormat.format(new Date()) + "_pid_" + pid + ".gz";
++        File tracesDir = new File(ActivityManagerService.ANR_TRACE_DIR);
++        File watchdogTraces = new File(tracesDir, newTracesPath);
++        File smaps = new File("/proc/" + pid + "/smaps");
++        copyToGzFile(smaps, watchdogTraces);
++    }
++//---duguowei
++
+     /**
+      * When the memory is close to the limit of the heap size, GC will be triggered frequently
+      * and cause system_server to slow execution.
+@@ -196,9 +307,12 @@ public class WatchdogImpl extends WatchdogStub {
+      */
+     @Override
+     public void checkOOMState(){
+-        if (!OOM_CRASH_ON_WATCHDOG) {
++        if (!OOM_CRASH_ON_WATCHDOG && !SystemProperties.getBoolean("debug.mem_on_watchdog", false)) {
+             return;
+         }
++//+++duguowei
++        checkProcessOomState(SystemProperties.getInt("debug.mem_pid", -1));
++//---duguowei
+ 
+         try {
+             Runtime runtime = Runtime.getRuntime();
